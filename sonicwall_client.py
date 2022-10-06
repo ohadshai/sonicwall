@@ -6,7 +6,7 @@ import logging
 import copy
 from collections import OrderedDict
 from requests.auth import HTTPDigestAuth
-from typing import List
+from typing import List, Union
 from requests.exceptions import HTTPError
 from strenum import StrEnum
 from enum import auto
@@ -106,7 +106,6 @@ class SonicWallClient:
     def _send_request(self, method, uri, headers=None, params=None, data=None, files=None, verify=False, **kwargs):
         url = f"{self.base_url}/{uri}"
         self.headers.update(headers or {})
-        # data = dict(self._config_override, **(data or {}))
         try:
             data = data and json.dumps(data)
         except:
@@ -180,6 +179,11 @@ class SonicWallClient:
         """
         if not policy_info:
             return
+        policy_name = policy_info[ipversion]['name']
+        policy = self.get_policy(policy_name)
+        if policy:
+            logger.info(f"Policy name: '{policy_name}' already exists")
+            return
         if self.version == 6:
             uri = 'access-rules'
             data = {
@@ -205,7 +209,7 @@ class SonicWallClient:
         """
         policy = self.get_policy(policy_name)
         controller = 'access-rules' if self.version == 6 else 'security-policies'
-        uri = f"{controller}/{ipversion}/uuid/{policy['ipv4']['uuid']}"
+        uri = f"{controller}/{ipversion}/uuid/{policy[ipversion]['uuid']}"
         res = self._send_request(Method.DELETE.value, uri=uri)
         self.commit()
         return res
@@ -239,15 +243,20 @@ class SonicWallClient:
         """
         if not group_info:
             return
+
         data = {
             "address_groups": [group_info]
         }
-        group_name = group_info['ipv4']['name']
-        if not self.get_address_group(group_name):
-            logger.info(f"Created new group: {group_name}")
+        address_objects = group_info[ipversion]['address_object'].get(ipversion)
+        if not address_objects:
+            del group_info[ipversion]['address_object']
+        group_name = group_info[ipversion]['name']
+        address_group = self.get_address_group(group_name)
+        if not address_group:
             res = self._send_request(Method.POST.value, uri=f'address-groups/{ipversion}', data=data)
+            logger.info(f"Created new group: {group_name}")
         else:
-            logger.info(f"Group {group_name} already exists. Adding spcified ips to the group")
+            logger.info(f"Group name: '{group_name}' already exists")
             res = self._send_request(Method.PATCH.value, uri=f'address-groups/{ipversion}', data=data)
         self.commit()
         return res
@@ -310,32 +319,35 @@ class SonicWallClient:
         self.commit()
         return res
 
-    def create_block_address_objects(self, mode: str, ips: List[ipaddress.IPv4Network]) -> List[dict]:
+    def create_block_address_objects(self, mode: str, ips: List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]],
+                                     ipversion: str = 'ipv4') -> List[dict]:
         """
         Create block address objects according to mode (blockexternal|blockinternal) and ips
         :param mode:
         :param ips:
         :return:
         """
-        address_objects = []
+        new_address_objects = []
+        existing_address_objects = []
         for ip in ips:
             address_object_name = MODE_INFO[mode]["address_object_name"].format(ip.network_address)
             address_object = self.get_address_object(address_object_name)
             if not address_object:
                 logger.info(f"Creating new address object with the name: '{address_object_name}'")
                 address_object = copy.deepcopy(ADDRESS_OBJECT_TEMPLATE)
-                address_object['ipv4'].update({
+                address_object[ipversion].update({
                     "name": address_object_name,
                     "zone": MODE_INFO[mode]["object_zone"],
                     "host": {"ip": str(ip.network_address)}
                 })
-                address_objects.append(address_object)
+                new_address_objects.append(address_object)
             else:
+                existing_address_objects.append(address_object)
                 logger.info(f"Address object with the name: '{address_object_name}' already exists")
-        self.create_address_objects(address_objects)
-        return address_objects
+        self.create_address_objects(new_address_objects)
+        return new_address_objects + existing_address_objects
 
-    def create_block_address_group(self, mode, address_objects: List[dict]):
+    def create_block_address_group(self, mode, address_objects: List[dict], ipversion: str = 'ipv4'):
         """
         Create block address group according to mode (blockexternal|blockinternal) and address_objects
         :param mode:
@@ -343,26 +355,22 @@ class SonicWallClient:
         :return:
         """
         address_group = copy.deepcopy(ADDRESS_GROUP_TEMPLATE)
-        address_group['ipv4'].update({
+        address_group[ipversion].update({
             "name": MODE_INFO[mode]["address_group_name"],
-            "address_object": {"ipv4": [{"name": address_object['ipv4']['name']} for address_object in
+            "address_object": {ipversion: [{"name": address_object[ipversion]['name']} for address_object in
                                                            address_objects]}
         })
         self.create_address_group(address_group)
 
-    def create_block_policy(self, mode):
+    def create_block_policy(self, mode, ipversion: str = 'ipv4'):
         """
         Create block policy according to mode (blockexternal|blockinternal)
         :param mode:
         :return:
         """
         policy_name = MODE_INFO[mode]["policy_name"]
-        policy = self.get_policy(policy_name)
-        if policy:
-            logger.info(f"Policy name: '{policy_name}' already exists")
-            return
         policy = copy.deepcopy(SECURITY_POLICY_TEMPLATE)
-        policy['ipv4'].update({
+        policy[ipversion].update({
             "name": policy_name,
             "uuid": str(uuid.uuid4()),
             "from": MODE_INFO[mode]["policy_from_zone"],
@@ -370,10 +378,9 @@ class SonicWallClient:
             "source": {"address": MODE_INFO[mode]["policy_source_address"]},
             "destination": {"address": MODE_INFO[mode]["policy_destination_address"]}
         })
-        self.create_policy(policy)
-        logger.info(f"Created new policy with the name: '{policy_name}'")
+        self.create_policy(policy, ipversion=ipversion)
 
-    def delete_block_address_objects(self, mode: str, ips: List[ipaddress.IPv4Network]):
+    def delete_block_address_objects(self, mode: str, ips: List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]], ipversion: str = 'ipv4'):
         """
         Delete block address objects according to mode (blockexternal|blockinternal) and ips
         :param mode:
@@ -382,14 +389,14 @@ class SonicWallClient:
         """
         for ip in ips:
             address_object_name = MODE_INFO[mode]["address_object_name"].format(ip.network_address)
-            address_object = self.get_address_object(address_object_name)
+            address_object = self.get_address_object(address_object_name, ipversion=ipversion)
             if address_object:
-                self.delete_address_object(address_object_name)
+                self.delete_address_object(address_object_name, ipversion=ipversion)
                 logger.info(f"Unblocked ip '{ip.network_address}'")
             else:
                 logger.info(f"ip '{ip}' doesn't exists")
 
-    def block_ips(self, mode: str, ips: List[ipaddress.IPv4Network]):
+    def block_ips(self, mode: str, ips: List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]], ipversion: str = 'ipv4'):
         """
         Block all ips given according to mode (blockexternal|blockinternal) and ips:
             1. Create address objects for all ips
@@ -399,11 +406,11 @@ class SonicWallClient:
         :param ips:
         :return:
         """
-        new_address_objects = self.create_block_address_objects(mode, ips)
-        self.create_block_address_group(mode, new_address_objects)
+        address_objects = self.create_block_address_objects(mode, ips, ipversion=ipversion)
+        self.create_block_address_group(mode, address_objects, ipversion=ipversion)
         self.create_block_policy(mode)
 
-    def unblock_ips(self, mode: str, ips: List[ipaddress.IPv4Network]):
+    def unblock_ips(self, mode: str, ips: List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]], ipversion: str = 'ipv4'):
         """
         Unblock all ip given:
             1. Delete all address objects with the relevant ips
@@ -413,10 +420,10 @@ class SonicWallClient:
         :return:
         """
         block_mode = mode.replace('un', '')
-        self.delete_block_address_objects(block_mode, ips)
+        self.delete_block_address_objects(block_mode, ips, ipversion=ipversion)
         address_group_name = MODE_INFO[block_mode]["address_group_name"]
-        address_group = self.get_address_group(address_group_name)
-        if address_group and not address_group['ipv4'].get('address_object'):
+        address_group = self.get_address_group(address_group_name, ipversion=ipversion)
+        if address_group and not address_group[ipversion].get('address_object'):
             logger.info(f"Address group '{address_group_name}' is empty. Removing policy '{MODE_INFO[block_mode]['policy_name']}' and address group '{address_group_name}'")
-            self.delete_policy(MODE_INFO[block_mode]["policy_name"])
-            self.delete_address_group(address_group_name)
+            self.delete_policy(MODE_INFO[block_mode]["policy_name"], ipversion=ipversion)
+            self.delete_address_group(address_group_name, ipversion=ipversion)

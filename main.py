@@ -61,6 +61,7 @@ def action(swcreds, ips, mode):
         else:
             s.unblock_ips(mode, ips)
             logger.info("Unblocking ip/s finished successfully")
+        s.logout()
 
 
 if __name__ == "__main__":
